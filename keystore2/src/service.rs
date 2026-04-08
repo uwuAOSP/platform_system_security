@@ -135,8 +135,21 @@ impl KeystoreService {
         }
     }
 
+    fn normalize_app_descriptor(&self, caller_uid: AppUid, key: &KeyDescriptor) -> KeyDescriptor {
+        match key.domain {
+            Domain::APP => KeyDescriptor {
+                domain: Domain::APP,
+                nspace: caller_uid.0,
+                alias: key.alias.clone(),
+                blob: None,
+            },
+            _ => key.clone(),
+        }
+    }
+
     fn get_key_entry(&self, key: &KeyDescriptor) -> Result<KeyEntryResponse> {
         let caller_uid = AppUid::calling();
+        let normalized_key = self.normalize_app_descriptor(caller_uid, key);
 
         let super_key = SUPER_KEY
             .read()
@@ -145,9 +158,9 @@ impl KeystoreService {
 
         let (key_id_guard, mut key_entry) = DB
             .with(|db| {
-                LEGACY_IMPORTER.with_try_import(key, caller_uid, super_key, || {
+                LEGACY_IMPORTER.with_try_import(&normalized_key, caller_uid, super_key, || {
                     db.borrow_mut().load_key_entry(
-                        key,
+                        &normalized_key,
                         KeyType::Client,
                         KeyEntryLoadBits::PUBLIC,
                         caller_uid,
@@ -195,21 +208,27 @@ impl KeystoreService {
         certificate_chain: Option<&[u8]>,
     ) -> Result<()> {
         let caller_uid = AppUid::calling();
+        let normalized_key = self.normalize_app_descriptor(caller_uid, key);
         let super_key = SUPER_KEY
             .read()
             .unwrap()
             .get_credential_encrypted_key_by_user_id(caller_uid.owning_user());
 
         DB.with::<_, Result<()>>(|db| {
-            let entry = match LEGACY_IMPORTER.with_try_import(key, caller_uid, super_key, || {
-                db.borrow_mut().load_key_entry(
-                    key,
-                    KeyType::Client,
-                    KeyEntryLoadBits::NONE,
-                    caller_uid,
-                    |k, av| check_key_permission(KeyPerm::Update, k, &av).context(ks_err!()),
-                )
-            }) {
+            let entry = match LEGACY_IMPORTER.with_try_import(
+                &normalized_key,
+                caller_uid,
+                super_key,
+                || {
+                    db.borrow_mut().load_key_entry(
+                        &normalized_key,
+                        KeyType::Client,
+                        KeyEntryLoadBits::NONE,
+                        caller_uid,
+                        |k, av| check_key_permission(KeyPerm::Update, k, &av).context(ks_err!()),
+                    )
+                },
+            ) {
                 Err(e) => match e.root_cause().downcast_ref::<Error>() {
                     Some(Error::Rc(ResponseCode::KEY_NOT_FOUND)) => Ok(None),
                     _ => Err(e),
@@ -340,19 +359,21 @@ impl KeystoreService {
         start_past_alias: Option<&str>,
     ) -> Result<Vec<KeyDescriptor>> {
         let k = self.get_key_descriptor_for_lookup(domain, namespace)?;
+
         DB.with(|db| list_key_entries(&mut db.borrow_mut(), k.domain, k.nspace, start_past_alias))
     }
 
     fn delete_key(&self, key: &KeyDescriptor) -> Result<()> {
         let caller_uid = AppUid::calling();
+        let normalized_key = self.normalize_app_descriptor(caller_uid, key);
         let super_key = SUPER_KEY
             .read()
             .unwrap()
             .get_credential_encrypted_key_by_user_id(caller_uid.owning_user());
 
         DB.with(|db| {
-            LEGACY_IMPORTER.with_try_import(key, caller_uid, super_key, || {
-                db.borrow_mut().unbind_key(key, KeyType::Client, caller_uid, |k, av| {
+            LEGACY_IMPORTER.with_try_import(&normalized_key, caller_uid, super_key, || {
+                db.borrow_mut().unbind_key(&normalized_key, KeyType::Client, caller_uid, |k, av| {
                     check_key_permission(KeyPerm::Delete, k, &av)
                         .context(ks_err!("During delete_key."))
                 })

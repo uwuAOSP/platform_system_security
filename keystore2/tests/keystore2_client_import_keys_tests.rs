@@ -35,6 +35,85 @@ use nix::unistd::getuid;
 use openssl::rand::rand_bytes;
 use openssl::x509::X509;
 
+/// Import an EC signing key and verify that APP-domain alias operations resolve to the same
+/// daemon-owned record as the imported KEY_ID.
+#[test]
+fn keystore2_imported_ec_key_alias_operations_resolve_consistently() {
+    let sl = SecLevel::tee();
+    let alias = format!("ks_import_ec_alias_test_{}_{}", getuid(), 256);
+    let _ = delete_app_key(&sl.keystore2, &alias);
+
+    let import_params = authorizations::AuthSetBuilder::new()
+        .no_auth_required()
+        .algorithm(Algorithm::EC)
+        .digest(Digest::SHA_2_256)
+        .purpose(KeyPurpose::SIGN)
+        .purpose(KeyPurpose::VERIFY)
+        .ec_curve(EcCurve::P_256)
+        .cert_not_before(0)
+        .cert_not_after(253402300799000);
+
+    let key_metadata = key_generations::import_ec_p_256_key(
+        &sl,
+        Domain::APP,
+        -1,
+        Some(alias.clone()),
+        import_params,
+    )
+    .expect("Failed to import EC key.");
+
+    let key_entry_response = sl
+        .keystore2
+        .getKeyEntry(&KeyDescriptor {
+            domain: Domain::APP,
+            nspace: -1,
+            alias: Some(alias.clone()),
+            blob: None,
+        })
+        .expect("Failed to look up imported EC key by alias.");
+    assert_eq!(key_metadata.key, key_entry_response.metadata.key);
+
+    let updated_cert = [0x42; 32];
+    let updated_chain = [0x24; 48];
+    sl.keystore2
+        .updateSubcomponent(
+            &KeyDescriptor {
+                domain: Domain::APP,
+                nspace: -1,
+                alias: Some(alias.clone()),
+                blob: None,
+            },
+            Some(&updated_cert),
+            Some(&updated_chain),
+        )
+        .expect("Failed to update imported key by alias.");
+
+    let by_key_id = sl
+        .keystore2
+        .getKeyEntry(&key_metadata.key)
+        .expect("Failed to load imported key by KEY_ID after alias update.");
+    assert_eq!(Some(updated_cert.to_vec()), by_key_id.metadata.certificate);
+    assert_eq!(Some(updated_chain.to_vec()), by_key_id.metadata.certificateChain);
+
+    sl.keystore2
+        .deleteKey(&KeyDescriptor {
+            domain: Domain::APP,
+            nspace: -1,
+            alias: Some(alias.clone()),
+            blob: None,
+        })
+        .expect("Failed to delete imported key by alias.");
+
+    let result = key_generations::map_ks_error(sl.keystore2.getKeyEntry(&KeyDescriptor {
+        domain: Domain::APP,
+        nspace: -1,
+        alias: Some(alias),
+        blob: None,
+    }));
+    assert!(result.is_err());
+    assert_eq!(Error::Rc(ResponseCode::KEY_NOT_FOUND), result.unwrap_err());
+}
+
 pub fn import_rsa_sign_key_and_perform_sample_operation(
     sl: &SecLevel,
     domain: Domain,
