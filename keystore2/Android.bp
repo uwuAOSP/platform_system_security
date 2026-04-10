@@ -70,6 +70,7 @@ rust_defaults {
         "libtokio",
         "libwatchdog_rs",
         "packagemanager_aidl-rust",
+        "keybox_attestation_aidl-rust",
     ],
     shared_libs: [
         "libcutils",
