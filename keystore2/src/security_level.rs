@@ -20,7 +20,8 @@ use crate::audit_log::{
 };
 use crate::database::{BlobInfo, CertificateInfo, KeyIdGuard};
 use crate::error::{
-    self, into_logged_binder, map_km_error, wrapped_rkpd_error_to_ks_error, Error, ErrorCode,
+    self, into_logged_binder, map_binder_status, map_binder_status_code, map_km_error,
+    wrapped_rkpd_error_to_ks_error, Error, ErrorCode,
 };
 use crate::globals::{
     get_remotely_provisioned_component_name, DB, ENFORCEMENTS, LEGACY_IMPORTER, SUPER_KEY,
@@ -64,6 +65,7 @@ use android_system_keystore2::aidl::android::system::keystore2::{
     KeyMetadata::KeyMetadata, KeyParameters::KeyParameters, ResponseCode::ResponseCode,
 };
 use anyhow::{anyhow, Context, Result};
+use keybox_attestation_aidl::aidl::android::security::keybox::IKeyboxAttestationService::IKeyboxAttestationService;
 use log::error;
 use postprocessor_client::process_certificate_chain;
 use rkpd_client::store_rkpd_attestation_key;
@@ -573,7 +575,10 @@ impl KeystoreSecurityLevel {
             .add_required_parameters(caller_uid, params, &key)
             .context(ks_err!("Trying to get aaid."))?;
 
-        let creation_result = match attestation_key_info {
+        let should_try_keybox_chain = attestation_key_info.is_none()
+            && params.iter().any(|kp| kp.tag == Tag::ATTESTATION_CHALLENGE);
+
+        let mut creation_result = match attestation_key_info {
             Some(AttestationKeyInfo::UserGenerated {
                 key_id_guard,
                 blob,
@@ -679,8 +684,72 @@ impl KeystoreSecurityLevel {
         }
         .context(ks_err!())?;
 
+        if should_try_keybox_chain {
+            self.try_replace_chain_via_keybox_service(
+                caller_uid,
+                &key,
+                &params,
+                &mut creation_result,
+            );
+        }
+
         let user = caller_uid.owning_user();
         self.store_new_key(key, creation_result, user, Some(flags)).context(ks_err!())
+    }
+
+    fn try_replace_chain_via_keybox_service(
+        &self,
+        target_uid: AppUid,
+        key: &KeyDescriptor,
+        params: &[KeyParameter],
+        creation_result: &mut KeyCreationResult,
+    ) {
+        let Some(leaf_certificate) =
+            creation_result.certificateChain.first().map(|c| c.encodedCertificate.clone())
+        else {
+            return;
+        };
+        if leaf_certificate.is_empty() {
+            return;
+        }
+
+        let service: Strong<dyn IKeyboxAttestationService> = match map_binder_status_code(
+            binder::get_interface("android.security.keybox"),
+        ) {
+            Ok(service) => service,
+            Err(e) => {
+                error!(
+                    "KeystoreSecurityLevel::generate_key: failed to connect android.security.keybox: {e:?}"
+                );
+                return;
+            }
+        };
+
+        let certs = match map_binder_status(service.generateCertificateChain(
+            target_uid.0 as i32,
+            key,
+            params,
+            &leaf_certificate,
+        )) {
+            Ok(certs) => certs,
+            Err(e) => {
+                error!(
+                    "KeystoreSecurityLevel::generate_key: keybox generateCertificateChain failed: {e:?}"
+                );
+                return;
+            }
+        };
+
+        if certs.certificate.is_empty() {
+            return;
+        }
+
+        let mut replaced_chain = Vec::with_capacity(2);
+        replaced_chain.push(Certificate { encodedCertificate: certs.certificate });
+        if !certs.certificateChain.is_empty() {
+            replaced_chain.push(Certificate { encodedCertificate: certs.certificateChain });
+        }
+        creation_result.certificateChain = replaced_chain;
     }
 
     fn import_key(
