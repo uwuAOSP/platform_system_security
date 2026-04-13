@@ -69,7 +69,8 @@ use android_system_keystore2::aidl::android::system::keystore2::{
     KeyMetadata::KeyMetadata, KeyParameters::KeyParameters, ResponseCode::ResponseCode,
 };
 use anyhow::{anyhow, Context, Result};
-use keybox_attestation_aidl::aidl::android::security::keybox::IKeyboxAttestationService::IKeyboxAttestationService;
+use keybox_attestation_aidl::aidl::com::android::internal::security::keybox::IKeyboxAttestationService::IKeyboxAttestationService;
+use keybox_attestation_aidl::aidl::com::android::internal::security::keybox::KeyboxKeyParameters::KeyboxKeyParameters;
 use log::error;
 use postprocessor_client::process_certificate_chain;
 use rkpd_client::store_rkpd_attestation_key;
@@ -96,6 +97,79 @@ pub struct KeystoreSecurityLevel {
 
 // Blob of 32 zeroes used as empty masking key.
 static ZERO_BLOB_32: &[u8] = &[0; 32];
+
+fn build_keybox_key_parameters(params: &[KeyParameter]) -> KeyboxKeyParameters {
+    let mut result = KeyboxKeyParameters {
+        keySize: 0,
+        algorithm: 0,
+        certificateSerial: Vec::new(),
+        certificateNotBefore: 0,
+        certificateNotAfter: 0,
+        certificateSubject: Vec::new(),
+        rsaPublicExponent: 0,
+        ecCurve: 0,
+        ecCurveName: String::new(),
+        purpose: Vec::new(),
+        digest: Vec::new(),
+        attestationChallenge: Vec::new(),
+        brand: Vec::new(),
+        device: Vec::new(),
+        product: Vec::new(),
+        manufacturer: Vec::new(),
+        model: Vec::new(),
+        securityLevel: 0,
+    };
+
+    for kp in params {
+        match (&kp.tag, &kp.value) {
+            (&Tag::KEY_SIZE, KeyParameterValue::Integer(v)) => result.keySize = *v,
+            (&Tag::ALGORITHM, KeyParameterValue::Algorithm(v)) => result.algorithm = v.0,
+            (&Tag::CERTIFICATE_SERIAL, KeyParameterValue::Blob(v)) => {
+                result.certificateSerial = v.clone()
+            }
+            (&Tag::CERTIFICATE_NOT_BEFORE, KeyParameterValue::DateTime(v)) => {
+                result.certificateNotBefore = *v
+            }
+            (&Tag::CERTIFICATE_NOT_AFTER, KeyParameterValue::DateTime(v)) => {
+                result.certificateNotAfter = *v
+            }
+            (&Tag::CERTIFICATE_SUBJECT, KeyParameterValue::Blob(v)) => {
+                result.certificateSubject = v.clone()
+            }
+            (&Tag::RSA_PUBLIC_EXPONENT, KeyParameterValue::LongInteger(v)) => {
+                result.rsaPublicExponent = *v
+            }
+            (&Tag::EC_CURVE, KeyParameterValue::EcCurve(v)) => {
+                result.ecCurve = v.0;
+                result.ecCurveName = match *v {
+                    android_hardware_security_keymint::aidl::android::hardware::security::keymint::EcCurve::EcCurve::CURVE_25519 => "CURVE_25519",
+                    android_hardware_security_keymint::aidl::android::hardware::security::keymint::EcCurve::EcCurve::P_224 => "secp224r1",
+                    android_hardware_security_keymint::aidl::android::hardware::security::keymint::EcCurve::EcCurve::P_256 => "secp256r1",
+                    android_hardware_security_keymint::aidl::android::hardware::security::keymint::EcCurve::EcCurve::P_384 => "secp384r1",
+                    android_hardware_security_keymint::aidl::android::hardware::security::keymint::EcCurve::EcCurve::P_521 => "secp521r1",
+                    _ => "",
+                }
+                .to_string();
+            }
+            (&Tag::PURPOSE, KeyParameterValue::KeyPurpose(v)) => result.purpose.push(v.0),
+            (&Tag::DIGEST, KeyParameterValue::Digest(v)) => result.digest.push(v.0),
+            (&Tag::ATTESTATION_CHALLENGE, KeyParameterValue::Blob(v)) => {
+                result.attestationChallenge = v.clone()
+            }
+            (&Tag::ATTESTATION_ID_BRAND, KeyParameterValue::Blob(v)) => result.brand = v.clone(),
+            (&Tag::ATTESTATION_ID_DEVICE, KeyParameterValue::Blob(v)) => result.device = v.clone(),
+            (&Tag::ATTESTATION_ID_PRODUCT, KeyParameterValue::Blob(v)) => result.product = v.clone(),
+            (&Tag::ATTESTATION_ID_MANUFACTURER, KeyParameterValue::Blob(v)) => {
+                result.manufacturer = v.clone()
+            }
+            (&Tag::ATTESTATION_ID_MODEL, KeyParameterValue::Blob(v)) => result.model = v.clone(),
+            (&Tag::HARDWARE_TYPE, KeyParameterValue::SecurityLevel(v)) => result.securityLevel = v.0,
+            _ => {}
+        }
+    }
+
+    result
+}
 
 impl KeystoreSecurityLevel {
     /// Creates a new security level instance wrapped in a
@@ -856,12 +930,14 @@ impl KeystoreSecurityLevel {
             }
         };
 
+        let keybox_params = build_keybox_key_parameters(params);
+
         let certs = match map_binder_status(service.generateCertificateChain(
             target_uid.0 as i32,
             key.alias.as_deref().unwrap_or(""),
             key.domain.0,
             key.nspace,
-            params,
+            &keybox_params,
             &leaf_certificate,
         )) {
             Ok(certs) => certs,
