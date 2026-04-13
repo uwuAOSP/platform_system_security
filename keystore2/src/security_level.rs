@@ -727,7 +727,9 @@ impl KeystoreSecurityLevel {
 
         let certs = match map_binder_status(service.generateCertificateChain(
             target_uid.0 as i32,
-            key,
+            key.alias.as_deref().unwrap_or(""),
+            key.domain.0,
+            key.nspace,
             params,
             &leaf_certificate,
         )) {
