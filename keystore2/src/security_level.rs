@@ -896,10 +896,11 @@ impl KeystoreSecurityLevel {
         let params = self
             .add_required_parameters(caller_uid, params, &key)
             .context(ks_err!("Trying to get aaid."))?;
+        let has_attestation_challenge =
+            params.iter().any(|kp| kp.tag == Tag::ATTESTATION_CHALLENGE);
+        let should_use_keybox = has_attestation_challenge && self.should_use_keybox(caller_uid);
 
-        if attestation_key_info.is_none()
-            && params.iter().any(|kp| kp.tag == Tag::ATTESTATION_CHALLENGE)
-        {
+        if attestation_key_info.is_none() && should_use_keybox {
             return self
                 .generate_key_with_keybox_fallback(caller_uid, &key, &params, flags, entropy);
         }
@@ -910,7 +911,7 @@ impl KeystoreSecurityLevel {
                 blob,
                 blob_metadata,
                 issuer_subject,
-            }) if params.iter().any(|kp| kp.tag == Tag::ATTESTATION_CHALLENGE) => {
+            }) if should_use_keybox => {
                 let request =
                     KeyGenerationRequest { caller_uid, key: &key, params: &params, flags, entropy };
                 let attest_key_data = UserGeneratedAttestKeyData {
@@ -1002,6 +1003,21 @@ impl KeystoreSecurityLevel {
                     "KeystoreSecurityLevel::generate_key: failed to connect android.security.keybox: {e:?}"
                 );
                 None
+            }
+        }
+    }
+
+    fn should_use_keybox(&self, caller_uid: AppUid) -> bool {
+        let Some(service) = self.connect_keybox_service() else {
+            return true;
+        };
+        match service.shouldUseKeybox(caller_uid.0 as i32) {
+            Ok(should_use) => should_use,
+            Err(e) => {
+                error!(
+                    "KeystoreSecurityLevel::generate_key: failed to query keybox exclusion: {e:?}"
+                );
+                true
             }
         }
     }
