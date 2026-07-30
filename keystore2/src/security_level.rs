@@ -57,7 +57,7 @@ use android_hardware_security_keymint::aidl::android::hardware::security::keymin
     HardwareAuthenticatorType::HardwareAuthenticatorType, IKeyMintDevice::IKeyMintDevice,
     KeyCharacteristics::KeyCharacteristics, KeyOrigin::KeyOrigin,
     KeyCreationResult::KeyCreationResult, KeyFormat::KeyFormat,
-    KeyMintHardwareInfo::KeyMintHardwareInfo, KeyOrigin::KeyOrigin, KeyParameter::KeyParameter,
+    KeyMintHardwareInfo::KeyMintHardwareInfo, KeyParameter::KeyParameter,
     KeyParameterValue::KeyParameterValue, SecurityLevel::SecurityLevel, Tag::Tag,
 };
 use android_hardware_security_keymint::binder::{BinderFeatures, Strong, ThreadState};
