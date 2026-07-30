@@ -26,6 +26,7 @@ use crate::error::{
 use crate::globals::{
     get_remotely_provisioned_component_name, DB, ENFORCEMENTS, LEGACY_IMPORTER, SUPER_KEY,
 };
+use crate::keybox_policy::should_route_to_keybox;
 use crate::key_parameter::KeyParameterValue as KsKeyParamValue;
 use crate::key_parameter::{KeyParameter as KsKeyParam, KmKeyParameter};
 use crate::ks_err;
@@ -898,7 +899,9 @@ impl KeystoreSecurityLevel {
             .context(ks_err!("Trying to get aaid."))?;
         let has_attestation_challenge =
             params.iter().any(|kp| kp.tag == Tag::ATTESTATION_CHALLENGE);
-        let should_use_keybox = has_attestation_challenge && self.should_use_keybox(caller_uid);
+        let should_use_keybox = should_route_to_keybox(has_attestation_challenge, || {
+            self.should_use_keybox(caller_uid)
+        });
 
         if attestation_key_info.is_none() && should_use_keybox {
             return self
@@ -1009,15 +1012,13 @@ impl KeystoreSecurityLevel {
 
     fn should_use_keybox(&self, caller_uid: AppUid) -> bool {
         let Some(service) = self.connect_keybox_service() else {
-            return true;
+            return false;
         };
         match service.shouldUseKeybox(caller_uid.0 as i32) {
             Ok(should_use) => should_use,
             Err(e) => {
-                error!(
-                    "KeystoreSecurityLevel::generate_key: failed to query keybox exclusion: {e:?}"
-                );
-                true
+                error!("KeystoreSecurityLevel::generate_key: failed to query keybox opt-in: {e:?}");
+                false
             }
         }
     }
