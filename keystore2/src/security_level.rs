@@ -101,20 +101,10 @@ pub struct KeystoreSecurityLevel {
 static ZERO_BLOB_32: &[u8] = &[0; 32];
 const MAX_ATTESTATION_CHALLENGE_SIZE_BYTES: usize = 128;
 
-struct UserGeneratedAttestKeyData<'a> {
-    key_id_guard: KeyIdGuard,
-    blob: &'a [u8],
-    blob_metadata: &'a BlobMetaData,
-    issuer_subject: &'a [u8],
-}
-
-struct KeyGenerationRequest<'a> {
-    caller_uid: AppUid,
-    key: &'a KeyDescriptor,
-    params: &'a [KeyParameter],
-    flags: i32,
-    entropy: &'a [u8],
-}
+const MAX_KEYBOX_ALIAS_UTF16_CODE_UNITS: usize = 1024;
+const MAX_KEYBOX_BLOB_SIZE_BYTES: usize = 32 * 1024;
+const MAX_KEYBOX_INT_ARRAY_ITEMS: usize = 1024;
+const MAX_KEYBOX_REQUEST_SIZE_BYTES: usize = 64 * 1024;
 
 fn build_keybox_key_parameters(params: &[KeyParameter]) -> KeyboxKeyParameters {
     let mut result = KeyboxKeyParameters {
@@ -191,6 +181,51 @@ fn build_keybox_key_parameters(params: &[KeyParameter]) -> KeyboxKeyParameters {
     }
 
     result
+}
+
+fn keybox_request_within_limits(
+    alias: &str,
+    params: &KeyboxKeyParameters,
+    payload: &[u8],
+) -> bool {
+    let blob_fields = [
+        &params.certificateSerial,
+        &params.certificateSubject,
+        &params.attestationChallenge,
+        &params.brand,
+        &params.device,
+        &params.product,
+        &params.manufacturer,
+        &params.model,
+        payload,
+    ];
+    if blob_fields
+        .iter()
+        .any(|field| field.len() > MAX_KEYBOX_BLOB_SIZE_BYTES)
+        || params.ecCurveName.encode_utf16().count() > MAX_KEYBOX_ALIAS_UTF16_CODE_UNITS
+        || params.purpose.len() > MAX_KEYBOX_INT_ARRAY_ITEMS
+        || params.digest.len() > MAX_KEYBOX_INT_ARRAY_ITEMS
+    {
+        return false;
+    }
+
+    let mut request_size = alias.encode_utf16().count().saturating_mul(2);
+    request_size = request_size.saturating_add(
+        params.ecCurveName.encode_utf16().count().saturating_mul(2),
+    );
+    request_size = request_size.saturating_add(
+        params
+            .purpose
+            .len()
+            .saturating_add(params.digest.len())
+            .saturating_mul(std::mem::size_of::<i32>()),
+    );
+    for field in blob_fields {
+        request_size = request_size.saturating_add(field.len());
+    }
+
+    alias.encode_utf16().count() <= MAX_KEYBOX_ALIAS_UTF16_CODE_UNITS
+        && request_size <= MAX_KEYBOX_REQUEST_SIZE_BYTES
 }
 
 fn is_attestation_related_tag(tag: Tag) -> bool {
@@ -914,25 +949,6 @@ impl KeystoreSecurityLevel {
                 blob,
                 blob_metadata,
                 issuer_subject,
-            }) if should_use_keybox => {
-                let request =
-                    KeyGenerationRequest { caller_uid, key: &key, params: &params, flags, entropy };
-                let attest_key_data = UserGeneratedAttestKeyData {
-                    key_id_guard,
-                    blob: &blob,
-                    blob_metadata: &blob_metadata,
-                    issuer_subject: &issuer_subject,
-                };
-                return self.generate_key_with_user_generated_attest_keybox_fallback(
-                    request,
-                    attest_key_data,
-                );
-            }
-            Some(AttestationKeyInfo::UserGenerated {
-                key_id_guard,
-                blob,
-                blob_metadata,
-                issuer_subject,
             }) => self.generate_key_with_user_generated_attest_key(
                 key_id_guard,
                 &blob,
@@ -1095,7 +1111,16 @@ impl KeystoreSecurityLevel {
         else {
             return false;
         };
-        if leaf_certificate.is_empty() {
+        if leaf_certificate.is_empty()
+            || !keybox_request_within_limits(
+                key.alias.as_deref().unwrap_or(""),
+                keybox_params,
+                &leaf_certificate,
+            )
+        {
+            error!(
+                "KeystoreSecurityLevel::generate_key: refusing oversized keybox certificate-chain request"
+            );
             return false;
         }
 
@@ -1135,6 +1160,17 @@ impl KeystoreSecurityLevel {
         entropy: &[u8],
         keybox_params: &KeyboxKeyParameters,
     ) -> Option<KeyCreationResult> {
+        if !keybox_request_within_limits(
+            key.alias.as_deref().unwrap_or(""),
+            keybox_params,
+            entropy,
+        ) {
+            error!(
+                "KeystoreSecurityLevel::generate_key: refusing oversized keybox software-key request"
+            );
+            return None;
+        }
+
         let certs = match map_binder_status(service.generateSoftwareKey(
             target_uid.0 as i32,
             key.alias.as_deref().unwrap_or(""),
@@ -1197,112 +1233,6 @@ impl KeystoreSecurityLevel {
         rewrite_origin_as_generated(&mut creation_result.keyCharacteristics);
         creation_result.certificateChain = replaced_chain;
         Some(creation_result)
-    }
-
-    fn generate_key_with_user_generated_attest_keybox_fallback(
-        &self,
-        request: KeyGenerationRequest<'_>,
-        attest_key_data: UserGeneratedAttestKeyData<'_>,
-    ) -> Result<KeyMetadata> {
-        let KeyGenerationRequest { caller_uid, key, params, flags, entropy } = request;
-        let UserGeneratedAttestKeyData { key_id_guard, blob, blob_metadata, issuer_subject } =
-            attest_key_data;
-
-        let Some(service) = self.connect_keybox_service() else {
-            let creation_result = self
-                .generate_key_with_user_generated_attest_key(
-                    key_id_guard,
-                    blob,
-                    blob_metadata,
-                    issuer_subject,
-                    params,
-                )
-                .context(ks_err!(
-                    "Keybox service unavailable while generating with a user-generated attestation key."
-                ))?;
-            return self
-                .store_new_key(key.clone(), creation_result, caller_uid.owning_user(), Some(flags))
-                .context(ks_err!());
-        };
-
-        let keybox_params = build_keybox_key_parameters(params);
-        let should_strip_for_generation = params.iter().any(|kp| {
-            matches!(
-                kp.tag,
-                Tag::ATTESTATION_ID_BRAND
-                    | Tag::ATTESTATION_ID_DEVICE
-                    | Tag::ATTESTATION_ID_PRODUCT
-                    | Tag::ATTESTATION_ID_SERIAL
-                    | Tag::ATTESTATION_ID_IMEI
-                    | Tag::ATTESTATION_ID_SECOND_IMEI
-                    | Tag::ATTESTATION_ID_MEID
-                    | Tag::ATTESTATION_ID_MANUFACTURER
-                    | Tag::ATTESTATION_ID_MODEL
-                    | Tag::INCLUDE_UNIQUE_ID
-                    | Tag::DEVICE_UNIQUE_ATTESTATION
-                    | Tag::RESET_SINCE_ID_ROTATION
-            )
-        });
-        let generation_params = if should_strip_for_generation {
-            strip_attestation_related_params(params)
-        } else {
-            params.to_vec()
-        };
-
-        let creation_result = match self.generate_key_with_user_generated_attest_key(
-            key_id_guard,
-            blob,
-            blob_metadata,
-            issuer_subject,
-            &generation_params,
-        ) {
-            Ok(mut creation_result) => {
-                if self.try_replace_chain_via_keybox_service(
-                    &service,
-                    caller_uid,
-                    key,
-                    &keybox_params,
-                    &mut creation_result,
-                ) {
-                    creation_result
-                } else if let Some(creation_result) = self.try_create_software_fallback_result(
-                    &service,
-                    caller_uid,
-                    key,
-                    params,
-                    entropy,
-                    &keybox_params,
-                ) {
-                    creation_result
-                } else {
-                    if should_strip_for_generation {
-                        return Err(error::Error::Km(ErrorCode::UNKNOWN_ERROR)).context(ks_err!(
-                            "Keybox chain replacement failed after stripped user-generated attestation key generation."
-                        ));
-                    }
-                    creation_result
-                }
-            }
-            Err(hardware_error) => {
-                if let Some(creation_result) = self.try_create_software_fallback_result(
-                    &service,
-                    caller_uid,
-                    key,
-                    params,
-                    entropy,
-                    &keybox_params,
-                ) {
-                    creation_result
-                } else {
-                    return Err(hardware_error).context(ks_err!(
-                        "Keybox fallback failed for user-generated attestation key flow."
-                    ));
-                }
-            }
-        };
-
-        self.store_new_key(key.clone(), creation_result, caller_uid.owning_user(), Some(flags))
-            .context(ks_err!())
     }
 
     fn generate_key_with_keybox_fallback(
